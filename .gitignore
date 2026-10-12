@@ -1,0 +1,4 @@
+.pio/
+.env
+.fonts/
+src/fonts_gen.h
