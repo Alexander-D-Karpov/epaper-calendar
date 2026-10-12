@@ -2,6 +2,8 @@
 #include <stdint.h>
 #include <time.h>
 
+#include "weather.h"
+
 class App {
 public:
   void setup();
@@ -31,4 +33,7 @@ private:
   time_t lastFull_ = 0;
   time_t lastLive_ = 0;
   time_t shownAt_ = 0;
+  time_t drawnAt_ = 0;
+  Weather weather_ = {};
+  Weather shownWeather_ = {};
 };

@@ -3,6 +3,7 @@
 #include <ESP8266WiFi.h>
 #include <GxEPD2_3C.h>
 #include <new>
+#include <umm_malloc/umm_heap_select.h>
 
 #include "agenda.h"
 #include "api.h"
@@ -66,7 +67,7 @@ private:
     return o;
   }
 
-  uint8_t bits_[(284 * 24 + 164 * 24 + 300 * 8 + 60 * 16) / 8];
+  uint8_t bits_[kLiveRegionBytes];
 };
 
 // Latched in the ISR so presses during a refresh or a sync are not lost.
@@ -87,10 +88,13 @@ void App::setup() {
   pinMode(cfg::kPinButton, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(cfg::kPinButton), onButton, FALLING);
   display.init(115200, true, 50, false);
+  // After display.init(): it restarts Serial and would eat this line.
+  Serial.printf("boot: %s\n", ESP.getResetReason().c_str());
   storeBegin();
   if (storeLoad(gSnap)) {
     haveData_ = true;
     dataHash_ = snapshotHash(gSnap);
+    weather_ = gSnap.weather;
     Serial.printf("cache: %u events from %ld\n", gSnap.eventCount,
                   static_cast<long>(gSnap.fetchedAt));
   }
@@ -192,30 +196,24 @@ void App::sync(time_t now) {
     online_ = false;
     return;
   }
-  bool full = !haveData_ || gSnap.firstDay != localDay(now) ||
-              now - gSnap.fetchedAt > static_cast<time_t>(cfg::kRefetchSec);
-  if (!full) {
-    int64_t latest;
-    if (!apiLatestSeq(latest)) {
-      online_ = false;
-      return;
-    }
-    online_ = true;
-    full = latest != gSnap.seq;
-  }
-  if (!full)
-    return;
-  if (apiFetchAll(gSnap)) {
+  // A new day re-asks without the ETag so the window always moves forward.
+  const bool conditional = haveData_ && gSnap.firstDay == localDay(now);
+  switch (apiFetchDisplay(gSnap, conditional)) {
+  case FetchResult::Updated:
     online_ = true;
     haveData_ = true;
     dataHash_ = snapshotHash(gSnap);
+    weather_ = gSnap.weather;
     if (!storeSave(gSnap))
       Serial.println("cache: save failed");
-  } else {
+    break;
+  case FetchResult::NotModified:
+    online_ = true;
+    gSnap.fetchedAt = static_cast<int32_t>(now);
+    break;
+  case FetchResult::Failed:
     online_ = false;
-    haveData_ = storeLoad(gSnap);
-    if (!haveData_)
-      memset(&gSnap, 0, sizeof(gSnap));
+    break;
   }
 }
 
@@ -225,12 +223,14 @@ uint32_t App::viewKey(time_t now, bool timeValid) const {
   h = mix(h, timeValid);
   if (!timeValid)
     return h;
-  const View v = makeView(gSnap, now, true, online_, GEO_LAT, GEO_LON);
+  const View v =
+      makeView(gSnap, now, true, online_, GEO_LAT, GEO_LON, weather_);
   h = mix(h, static_cast<uint32_t>(v.agenda.today));
   h = mix(h, v.sleep.sleeping);
   if (v.sleep.sleeping)
     return h;
   h = mix(h, static_cast<uint32_t>(v.phase));
+  h = mix(h, skyKind(v));
   h = mix(h, static_cast<uint32_t>(v.agenda.card + 1));
   h = mix(h, v.agenda.cardCurrent);
   return mix(h, static_cast<uint32_t>(v.agenda.next + 1));
@@ -241,13 +241,20 @@ void App::refresh(time_t now) {
     return;
   const bool timeValid = timeReady();
   const uint32_t key = viewKey(now, timeValid);
+  // A day screen that has not changed for kStuckSec means partials stopped
+  // working; fall back to a full refresh instead of freezing silently.
+  const bool stuck = liveReady_ && timeValid && drawnAt_ &&
+                     now - drawnAt_ >= static_cast<time_t>(cfg::kStuckSec);
   const bool stale = lastFull_ && timeValid &&
                      (now - lastFull_ >= static_cast<time_t>(cfg::kCleanSec) ||
                       partials_ >= cfg::kMaxPartials);
-  if (key != lastKey_ || stale) {
+  if (key != lastKey_ || stale || stuck) {
     if (lastFull_ && timeValid &&
         now - lastFull_ < static_cast<time_t>(cfg::kMinRenderGapSec))
       return;
+    if (stuck)
+      Serial.printf("render: stuck for %ld s\n",
+                    static_cast<long>(now - drawnAt_));
     renderFull(now, timeValid);
     lastKey_ = key;
     return;
@@ -258,7 +265,8 @@ void App::refresh(time_t now) {
 }
 
 void App::renderFull(time_t now, bool timeValid) {
-  const View v = makeView(gSnap, now, timeValid, online_, GEO_LAT, GEO_LON);
+  const View v =
+      makeView(gSnap, now, timeValid, online_, GEO_LAT, GEO_LON, weather_);
   Serial.printf("render: full phase %u sleeping %d online %d heap %u\n",
                 static_cast<unsigned>(v.phase), v.sleep.sleeping, online_,
                 ESP.getFreeHeap());
@@ -268,24 +276,38 @@ void App::renderFull(time_t now, bool timeValid) {
     paint([&v](Adafruit_GFX &g) { renderDay(g, v); });
   liveReady_ = timeValid && !v.sleep.sleeping;
   shownAt_ = now;
+  shownWeather_ = weather_;
   lastFull_ = now;
   lastLive_ = now;
+  drawnAt_ = now;
   partials_ = 0;
 }
 
+LiveCanvas *newCanvas() {
+  LiveCanvas *c = new (std::nothrow) LiveCanvas();
+  if (c)
+    return c;
+  HeapSelectIram iram;
+  return new (std::nothrow) LiveCanvas();
+}
+
 void App::renderLive(time_t now) {
-  LiveCanvas *before = new (std::nothrow) LiveCanvas();
-  LiveCanvas *after = new (std::nothrow) LiveCanvas();
+  LiveCanvas *before = newCanvas();
+  LiveCanvas *after = newCanvas();
   if (!before || !after) {
     delete before;
     delete after;
+    Serial.printf("render: live no memory heap %u block %u\n",
+                  ESP.getFreeHeap(), ESP.getMaxFreeBlockSize());
+    lastLive_ = now;
     return;
   }
   before->clear();
   after->clear();
-  renderDay(*before,
-            makeView(gSnap, shownAt_, true, online_, GEO_LAT, GEO_LON));
-  renderDay(*after, makeView(gSnap, now, true, online_, GEO_LAT, GEO_LON));
+  renderDay(*before, makeView(gSnap, shownAt_, true, online_, GEO_LAT, GEO_LON,
+                              shownWeather_));
+  renderDay(*after,
+            makeView(gSnap, now, true, online_, GEO_LAT, GEO_LON, weather_));
   uint8_t updated = 0;
   for (uint8_t i = 0; i < kLiveRegionCount; i++) {
     const size_t n = after->regionSize(i);
@@ -304,7 +326,9 @@ void App::renderLive(time_t now) {
   if (updated) {
     display.epd2.hibernate();
     partials_++;
+    drawnAt_ = now;
   }
   shownAt_ = now;
+  shownWeather_ = weather_;
   lastLive_ = now;
 }

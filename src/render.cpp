@@ -2,6 +2,7 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "fonts_gen.h"
@@ -29,6 +30,7 @@ constexpr int16_t kTodoRowsY = 326;
 constexpr int16_t kTodoRowH = 14;
 constexpr int16_t kFooterY = 384;
 constexpr int16_t kClockX = 240;
+constexpr int32_t kWeatherMaxAge = 3 * 3600;
 
 const uint8_t kBayer[8][8] = {
     {0, 32, 8, 40, 2, 34, 10, 42},  {48, 16, 56, 24, 50, 18, 58, 26},
@@ -162,7 +164,7 @@ const char *plural(int n, const char *one, const char *few, const char *many) {
 }
 
 Tone eventTone(const View &v, const Event &e, const Theme &th) {
-  return themed(v.snap->calendars[e.cal].tone, th);
+  return themed(e.tone, th);
 }
 
 void hills(Adafruit_GFX &g, int16_t x0, int16_t w, int16_t base, int16_t bottom,
@@ -198,11 +200,317 @@ void stars(Adafruit_GFX &g, int16_t x0, int16_t y0, int16_t w, int16_t h,
   }
 }
 
+enum class Sky : uint8_t {
+  Clear,
+  Partly,
+  Cloudy,
+  Fog,
+  Drizzle,
+  Rain,
+  Snow,
+  Thunder
+};
+
+Sky skyFor(uint8_t code) {
+  if (code == 0 || code == 1)
+    return Sky::Clear;
+  if (code == 2)
+    return Sky::Partly;
+  if (code == 3)
+    return Sky::Cloudy;
+  if (code == 45 || code == 48)
+    return Sky::Fog;
+  if (code >= 51 && code <= 57)
+    return Sky::Drizzle;
+  if ((code >= 61 && code <= 67) || (code >= 80 && code <= 82))
+    return Sky::Rain;
+  if ((code >= 71 && code <= 77) || code == 85 || code == 86)
+    return Sky::Snow;
+  if (code >= 95)
+    return Sky::Thunder;
+  return Sky::Cloudy;
+}
+
+void cloud(Adafruit_GFX &g, int16_t x, int16_t y, uint16_t fg, uint16_t bg) {
+  g.fillCircle(x + 5, y + 5, 4, bg);
+  g.fillCircle(x + 10, y + 4, 5, bg);
+  g.fillRoundRect(x, y + 4, 17, 7, 3, bg);
+  g.fillCircle(x + 5, y + 5, 3, fg);
+  g.fillCircle(x + 10, y + 4, 4, fg);
+  g.fillRoundRect(x + 1, y + 5, 15, 5, 2, fg);
+}
+
+void sunGlyph(Adafruit_GFX &g, int16_t cx, int16_t cy, int16_t r, uint16_t fg) {
+  g.fillCircle(cx, cy, r, fg);
+  for (uint8_t a = 0; a < 8; a++) {
+    const float an = a * static_cast<float>(M_PI) / 4;
+    g.drawLine(
+        cx + lroundf(cosf(an) * (r + 2)), cy + lroundf(sinf(an) * (r + 2)),
+        cx + lroundf(cosf(an) * (r + 3)), cy + lroundf(sinf(an) * (r + 3)), fg);
+  }
+}
+
+void moonGlyph(Adafruit_GFX &g, int16_t cx, int16_t cy, int16_t r, uint16_t fg,
+               uint16_t bg) {
+  g.fillCircle(cx, cy, r, fg);
+  g.fillCircle(cx + r / 2 + 1, cy - r / 2, r - 1, bg);
+}
+
+bool inCloud(int16_t px, int16_t py, int16_t cx, int16_t cy, int16_t w) {
+  const int16_t h = w * 2 / 5;
+  const int32_t r1 = h / 2;
+  const int32_t r2 = h * 2 / 3;
+  const int32_t r3 = h / 2;
+  auto in = [&](int32_t ox, int32_t oy, int32_t r) {
+    const int32_t dx = px - ox;
+    const int32_t dy = py - oy;
+    return dx * dx + dy * dy <= r * r;
+  };
+  if (py <= cy + h / 2 && py >= cy && px >= cx - w / 2 + r1 / 2 &&
+      px <= cx + w / 2 - r3 / 2)
+    return true;
+  return in(cx - w / 4, cy, r1) || in(cx + w / 12, cy - h / 5, r2) ||
+         in(cx + w / 3, cy + h / 8, r3) ||
+         in(cx - w / 2 + r1 / 2, cy + h / 4, r1 / 2 + 1) ||
+         in(cx + w / 2 - r3 / 2, cy + h / 4, r3 / 2 + 1);
+}
+
+struct Puff {
+  int16_t cx;
+  int16_t cy;
+  int16_t w;
+};
+
+Puff puffAt(int16_t cx, int16_t bottom, int16_t w) {
+  return {cx, static_cast<int16_t>(bottom - (w * 2 / 5) / 2), w};
+}
+
+bool inPuffs(const Puff *p, uint8_t n, int16_t x, int16_t y) {
+  for (uint8_t i = 0; i < n; i++) {
+    if (inCloud(x, y, p[i].cx, p[i].cy, p[i].w))
+      return true;
+  }
+  return false;
+}
+
+void skyClouds(Adafruit_GFX &g, const Puff *p, uint8_t n, Tone fill,
+               uint16_t edge) {
+  int16_t top = kSkyH;
+  int16_t bottom = 0;
+  for (uint8_t i = 0; i < n; i++) {
+    const int16_t h = p[i].w * 2 / 5;
+    if (p[i].cy - h < top)
+      top = p[i].cy - h;
+    if (p[i].cy + h > bottom)
+      bottom = p[i].cy + h;
+  }
+  if (top < 0)
+    top = 0;
+  if (bottom > kSkyH - 1)
+    bottom = kSkyH - 1;
+  for (int16_t y = top; y <= bottom; y++) {
+    for (int16_t x = kSkyX; x < kW; x++) {
+      if (!inPuffs(p, n, x, y))
+        continue;
+      const bool border = !inPuffs(p, n, x - 1, y) ||
+                          !inPuffs(p, n, x + 1, y) ||
+                          !inPuffs(p, n, x, y - 1) || !inPuffs(p, n, x, y + 1);
+      g.drawPixel(x, y, border ? edge : tonePixel(fill, x, y));
+    }
+  }
+}
+
+void haloPixel(Adafruit_GFX &g, int16_t x, int16_t y, uint16_t color,
+               uint16_t halo) {
+  if (x < kSkyX + 1 || x >= kW - 1 || y < 0 || y >= kSkyH)
+    return;
+  g.drawPixel(x - 1, y, halo);
+  g.drawPixel(x + 1, y, halo);
+}
+
+void skyPattern(Adafruit_GFX &g, int16_t top, int16_t bottom, bool snow,
+                uint8_t density, uint16_t color, uint16_t halo) {
+  const int16_t stepX = density > 1 ? 10 : 15;
+  const int16_t stepY = density > 1 ? 8 : 11;
+  uint8_t row = 0;
+  for (int16_t y = top; y < bottom; y += stepY, row++) {
+    for (int16_t x = kSkyX + 4 + (row & 1) * (stepX / 2); x < kW - 3;
+         x += stepX) {
+      if (snow) {
+        for (int16_t dy = -2; dy <= 2; dy++) {
+          for (int16_t dx = -2; dx <= 2; dx++) {
+            if (abs(dx) + abs(dy) <= 2 && y + dy >= 0 && y + dy < kSkyH)
+              g.drawPixel(x + dx, y + dy, halo);
+          }
+        }
+        g.drawFastHLine(x - 1, y, 3, color);
+        g.drawFastVLine(x, y - 1, 3, color);
+      } else {
+        const uint8_t len = density > 1 ? 4 : 2;
+        for (uint8_t k = 0; k < len; k++)
+          haloPixel(g, x - k / 2, y + k, color, halo);
+        for (uint8_t k = 0; k < len; k++) {
+          if (y + k < kSkyH)
+            g.drawPixel(x - k / 2, y + k, color);
+        }
+      }
+    }
+  }
+}
+
+const char *const kBoltBig[] = {
+    "....####", "...####.", "...###..", "..###...", "..######", ".######.",
+    "....###.", "...###..", "...##...", "..##....", "..#.....", ".#......",
+};
+
+const char *const kBoltSmall[] = {
+    "..##.", ".##..", ".####", "..##.", "..#..", ".#...",
+};
+
+void bitmapGlyph(Adafruit_GFX &g, const char *const *rows, uint8_t h, int16_t x,
+                 int16_t y, uint16_t color, uint16_t edge, bool outline) {
+  const uint8_t w = static_cast<uint8_t>(strlen(rows[0]));
+  auto on = [&](int16_t cx, int16_t cy) {
+    return cx >= 0 && cy >= 0 && cx < w && cy < h && rows[cy][cx] == '#';
+  };
+  if (outline) {
+    for (int16_t cy = -1; cy <= h; cy++) {
+      for (int16_t cx = -1; cx <= w; cx++) {
+        if (on(cx, cy))
+          continue;
+        if (on(cx - 1, cy) || on(cx + 1, cy) || on(cx, cy - 1) ||
+            on(cx, cy + 1))
+          g.drawPixel(x + cx, y + cy, edge);
+      }
+    }
+  }
+  for (uint8_t cy = 0; cy < h; cy++) {
+    for (uint8_t cx = 0; cx < w; cx++) {
+      if (rows[cy][cx] == '#')
+        g.drawPixel(x + cx, y + cy, color);
+    }
+  }
+}
+
+struct SkyLook {
+  Tone cloud;
+  uint16_t edge;
+  uint16_t drop;
+  uint16_t halo;
+};
+
+SkyLook skyLook(Phase p) {
+  switch (p) {
+  case Phase::Morning:
+    return {{0, 0}, kBlack, kBlack, kWhite};
+  case Phase::Evening:
+    return {{14, 34}, kBlack, kWhite, kBlack};
+  case Phase::Night:
+    return {{0, 40}, kWhite, kWhite, kBlack};
+  case Phase::Day:
+  default:
+    return {{0, 0}, kBlack, kBlack, kWhite};
+  }
+}
+
+void drawSkyWeather(Adafruit_GFX &g, const View &v, int16_t sunX,
+                    int16_t sunY) {
+  if (!v.weather.valid || !v.timeValid ||
+      v.now - v.weather.fetchedAt >= kWeatherMaxAge)
+    return;
+  const Sky sky = skyFor(v.weather.code);
+  if (sky == Sky::Clear)
+    return;
+  const SkyLook look = skyLook(v.phase);
+  const int16_t mid = kSkyX + (kW - kSkyX) / 2;
+  int16_t ax = sunX > 0 ? sunX : mid;
+  if (ax < kSkyX + 26)
+    ax = kSkyX + 26;
+  if (ax > kW - 26)
+    ax = kW - 26;
+  const int16_t ay = sunY > 0 ? (sunY < 16 ? 16 : sunY) : 22;
+  switch (sky) {
+  case Sky::Partly: {
+    const Puff near[] = {
+        puffAt(ax + 14, ay + 15 > kSkyH - 8 ? kSkyH - 8 : ay + 15, 34)};
+    const Puff far[] = {puffAt(ax > mid ? kSkyX + 22 : kW - 22, 22, 26)};
+    skyClouds(g, near, 1, look.cloud, look.edge);
+    skyClouds(g, far, 1, look.cloud, look.edge);
+    break;
+  }
+  case Sky::Fog:
+    for (uint8_t i = 0; i < 4; i++) {
+      const int16_t y = 24 + i * 9;
+      const int16_t inset = (i & 1) ? 12 : 4;
+      fillTone(g, kSkyX + inset, y, kW - kSkyX - inset - 4, 3,
+               v.phase == Phase::Night ? Tone{0, 30} : Tone{0, 0});
+    }
+    break;
+  case Sky::Cloudy: {
+    const int16_t low = ay + 14 > kSkyH - 8 ? kSkyH - 8 : ay + 14;
+    const Puff high[] = {puffAt(kSkyX + 20, 24, 38), puffAt(mid + 6, 24, 46),
+                         puffAt(kW - 18, 24, 36)};
+    const Puff near[] = {puffAt(ax - 12, low, 44), puffAt(ax + 16, low, 44)};
+    skyClouds(g, high, 3, look.cloud, look.edge);
+    skyClouds(g, near, 2, look.cloud, look.edge);
+    break;
+  }
+  case Sky::Drizzle:
+  case Sky::Rain:
+  case Sky::Snow:
+  case Sky::Thunder: {
+    const bool dark =
+        (sky == Sky::Thunder || sky == Sky::Rain) && v.phase != Phase::Night;
+    const uint8_t k = static_cast<uint8_t>(look.cloud.k + 40 > 64 - look.cloud.r
+                                               ? 64 - look.cloud.r
+                                               : look.cloud.k + 40);
+    const Tone fill = dark ? Tone{look.cloud.r, k} : look.cloud;
+    if (sky == Sky::Snow)
+      skyPattern(g, 36, kSkyH, true, 2, look.drop, look.halo);
+    else
+      skyPattern(g, 35, kSkyH, false, sky == Sky::Drizzle ? 1 : 2, look.drop,
+                 look.halo);
+    const Puff puffs[] = {puffAt(kSkyX + 18, 30, 38), puffAt(mid - 4, 30, 48),
+                          puffAt(kW - 18, 30, 38), puffAt(mid - 24, 30, 40),
+                          puffAt(mid + 22, 30, 42)};
+    skyClouds(g, puffs, 5, fill, look.edge);
+    if (sky == Sky::Thunder)
+      bitmapGlyph(g, kBoltBig, 12, mid - 2, 32, kRed, look.edge, true);
+    break;
+  }
+  case Sky::Clear:
+    break;
+  }
+}
+
 void drawSky(Adafruit_GFX &g, const View &v, const Theme &th) {
   const int16_t x0 = kSkyX;
   const int16_t w = kW - kSkyX;
   const int16_t hz = kSkyH - 12;
-  gradV(g, x0, 0, w, kSkyH, th.sky, 3);
+  Tone sky[3] = {th.sky[0], th.sky[1], th.sky[2]};
+  const bool weatherOk = v.weather.valid && v.timeValid &&
+                         v.now - v.weather.fetchedAt < kWeatherMaxAge;
+  const Sky look = weatherOk ? skyFor(v.weather.code) : Sky::Clear;
+  if (look != Sky::Clear && look != Sky::Partly && v.phase != Phase::Night) {
+    for (Tone &t : sky) {
+      if (look == Sky::Fog) {
+        t.k = static_cast<uint8_t>(t.k / 2);
+        t.r = static_cast<uint8_t>(t.r / 2);
+        continue;
+      }
+      const uint8_t add = look == Sky::Cloudy                         ? 16
+                          : look == Sky::Rain || look == Sky::Thunder ? 4
+                                                                      : 8;
+      t.k = static_cast<uint8_t>(t.k + add > 64 - t.r ? 64 - t.r : t.k + add);
+      t.r = static_cast<uint8_t>(t.r * 2 / 3);
+    }
+  }
+  gradV(g, x0, 0, w, kSkyH, sky, 3);
+  int16_t sunX = 0;
+  int16_t sunY = 0;
+  const bool hidden = look == Sky::Cloudy || look == Sky::Drizzle ||
+                      look == Sky::Rain || look == Sky::Snow ||
+                      look == Sky::Thunder;
   constexpr float kAzMin = 25.0f;
   constexpr float kAzMax = 335.0f;
   constexpr float kElMax = 55.0f;
@@ -219,12 +527,16 @@ void drawSky(Adafruit_GFX &g, const View &v, const Theme &th) {
   if (v.phase == Phase::Night) {
     const int16_t mx = kW - 22;
     const int16_t my = 18;
-    stars(g, x0 + 2, 2, w - 4, hz - 10, static_cast<uint32_t>(v.agenda.today),
-          14, mx, my, 16);
-    g.fillCircle(mx, my, 10, kWhite);
-    g.fillCircle(mx + 5, my - 4, 9, kBlack);
+    if (!hidden) {
+      stars(g, x0 + 2, 2, w - 4, hz - 10, static_cast<uint32_t>(v.agenda.today),
+            14, mx, my, 16);
+      g.fillCircle(mx, my, 10, kWhite);
+      g.fillCircle(mx + 5, my - 4, 9, kBlack);
+    }
+    sunX = mx;
+    sunY = my;
   } else {
-    if (v.sunDay.rises) {
+    if (v.sunDay.rises && !hidden) {
       for (time_t t = v.sunDay.sunrise; t <= v.sunDay.sunset; t += 900) {
         const SunPos p = sunPosition(t, v.lat, v.lon);
         if (p.elevation <= 0)
@@ -241,7 +553,9 @@ void drawSky(Adafruit_GFX &g, const View &v, const Theme &th) {
         sx = kW - kSunR - 3;
       if (sy < kSunR + 2)
         sy = kSunR + 2;
-      if (v.phase == Phase::Day) {
+      sunX = sx;
+      sunY = sy;
+      if (!hidden && v.phase == Phase::Day) {
         for (uint8_t a = 0; a < 8; a++) {
           const float an = a * static_cast<float>(M_PI) / 4;
           g.drawLine(sx + cosf(an) * (kSunR + 3), sy + sinf(an) * (kSunR + 3),
@@ -250,12 +564,13 @@ void drawSky(Adafruit_GFX &g, const View &v, const Theme &th) {
         }
         g.fillCircle(sx, sy, kSunR, kBlack);
         g.fillCircle(sx, sy, kSunR - 2, kWhite);
-      } else {
+      } else if (!hidden) {
         g.fillCircle(sx, sy, kSunR, kRed);
         g.drawCircle(sx, sy, kSunR, v.phase == Phase::Evening ? kBlack : kRed);
       }
     }
   }
+  drawSkyWeather(g, v, sunX, sunY);
   hills(g, x0, w, hz + 2, kSkyH, 0.6f, 6.0f, th.hillsBack);
   hills(g, x0, w, hz + 7, kSkyH, 2.1f, 4.0f, th.hillsFront);
 }
@@ -284,9 +599,16 @@ void drawHeader(Adafruit_GFX &g, const View &v, const Theme &th) {
     formatHm(v.sunDay.sunset, buf, sizeof(buf));
     x += drawText(g, &FontS, x, 66, buf, th.fg) + 9;
   }
-  if (v.timeValid) {
-    const int el = static_cast<int>(lroundf(v.sun.elevation));
-    snprintf(buf, sizeof(buf), "%s%d°", el < 0 ? "−" : "", el < 0 ? -el : el);
+  if (v.weather.valid && v.timeValid &&
+      v.now - v.weather.fetchedAt < kWeatherMaxAge) {
+    drawWeatherIcon(g, x, 52, v.weather.code, v.weather.isDay, th.fg, th.bg);
+    x += 22;
+    const int t = static_cast<int>(lroundf(v.weather.tempX10 / 10.0f));
+    snprintf(buf, sizeof(buf), "%s%d°",
+             t < 0   ? "−"
+             : t > 0 ? "+"
+                     : "",
+             t < 0 ? -t : t);
     drawText(g, &FontSB, x, 66, buf, th.fg);
   }
   drawSky(g, v, th);
@@ -626,11 +948,13 @@ const Rect kLiveRegions[kLiveRegionCount] = {
     {136, kCardY + kCardH, kW - 136, 24},
     {0, kStripY - 8, kW, 8},
     {kClockX, kFooterY, kW - kClockX, kH - kFooterY},
+    {0, 48, kSkyX - 2, 24},
 };
 
 View makeView(const Snapshot &s, time_t now, bool timeValid, bool online,
-              double lat, double lon) {
+              double lat, double lon, const Weather &w) {
   View v = {};
+  v.weather = w;
   v.snap = &s;
   v.now = now;
   v.timeValid = timeValid;
@@ -744,6 +1068,66 @@ void renderSleep(Adafruit_GFX &g, const View &v) {
     snprintf(buf + n, sizeof(buf) - n, " · %d %s", todos,
              plural(todos, "задача", "задачи", "задач"));
   drawFooter(g, v, buf, false);
+}
+
+uint8_t skyKind(const View &v) {
+  if (!v.weather.valid || !v.timeValid ||
+      v.now - v.weather.fetchedAt >= kWeatherMaxAge)
+    return 0xFF;
+  return static_cast<uint8_t>(skyFor(v.weather.code));
+}
+
+void drawWeatherIcon(Adafruit_GFX &g, int16_t x, int16_t y, uint8_t code,
+                     bool isDay, uint16_t fg, uint16_t bg) {
+  switch (skyFor(code)) {
+  case Sky::Clear:
+    if (isDay)
+      sunGlyph(g, x + 8, y + 8, 4, fg);
+    else
+      moonGlyph(g, x + 8, y + 8, 6, fg, bg);
+    break;
+  case Sky::Partly:
+    if (isDay)
+      sunGlyph(g, x + 6, y + 5, 3, fg);
+    else
+      moonGlyph(g, x + 6, y + 5, 4, fg, bg);
+    cloud(g, x + 1, y + 4, fg, bg);
+    break;
+  case Sky::Cloudy:
+    cloud(g, x + 3, y, fg, bg);
+    cloud(g, x, y + 4, fg, bg);
+    break;
+  case Sky::Fog:
+    for (uint8_t i = 0; i < 4; i++)
+      g.drawFastHLine(x + (i & 1 ? 3 : 0), y + 3 + i * 3, 15, fg);
+    break;
+  case Sky::Drizzle:
+    cloud(g, x, y, fg, bg);
+    for (uint8_t i = 0; i < 3; i++)
+      g.drawFastVLine(x + 4 + i * 5, y + 12 + (i & 1), 2, fg);
+    break;
+  case Sky::Rain:
+    cloud(g, x, y, fg, bg);
+    for (uint8_t i = 0; i < 3; i++) {
+      const int16_t rx = x + 5 + i * 5;
+      g.drawFastVLine(rx, y + 12, 2, fg);
+      g.drawFastVLine(rx - 1, y + 14, 2, fg);
+    }
+    break;
+  case Sky::Snow:
+    cloud(g, x, y, fg, bg);
+    for (uint8_t i = 0; i < 3; i++) {
+      const int16_t sx = x + 4 + i * 5;
+      const int16_t sy = y + 14 + (i & 1);
+      g.drawFastHLine(sx - 1, sy, 3, fg);
+      g.drawFastVLine(sx, sy - 1, 3, fg);
+    }
+    break;
+  case Sky::Thunder:
+    cloud(g, x, y, fg, bg);
+    bitmapGlyph(g, kBoltSmall, 6, x + 6, y + 11, fg, bg, false);
+    break;
+  }
 }
 
 void renderMessage(Adafruit_GFX &g, const char *title, const char *body) {

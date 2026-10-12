@@ -40,11 +40,10 @@ uint32_t snapshotHash(const Snapshot &s) {
       h *= 16777619u;
     }
   };
-  mix(&s.seq, sizeof(s.seq));
+  // Weather is left out: it changes often and has its own live region.
   mix(&s.firstDay, sizeof(s.firstDay));
   mix(s.events, sizeof(Event) * s.eventCount);
   mix(s.todos, sizeof(Todo) * s.todoCount);
-  mix(s.calendars, sizeof(Calendar) * s.calendarCount);
   mix(s.sleep, sizeof(SleepWindow) * s.sleepCount);
   mix(s.pool, s.poolUsed);
   return h;

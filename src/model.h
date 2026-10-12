@@ -2,23 +2,19 @@
 #include <stdint.h>
 #include <time.h>
 
-constexpr uint8_t kMaxCalendars = 12;
+#include "weather.h"
+
 constexpr uint8_t kMaxEvents = 40;
 constexpr uint8_t kMaxTodos = 24;
 constexpr uint8_t kMaxSleep = 14;
 constexpr uint16_t kPoolSize = 4096;
 constexpr uint8_t kMaxStrLen = 120;
 constexpr uint32_t kSnapshotMagic = 0x45504331;
-constexpr uint16_t kSnapshotVersion = 4;
+constexpr uint16_t kSnapshotVersion = 5;
 
 struct Tone {
   uint8_t r;
   uint8_t k;
-};
-
-struct Calendar {
-  char id[37];
-  Tone tone;
 };
 
 enum EventFlags : uint8_t {
@@ -29,7 +25,7 @@ enum EventFlags : uint8_t {
 struct Event {
   int32_t start;
   int32_t end;
-  uint8_t cal;
+  Tone tone;
   uint8_t flags;
   uint16_t title;
   uint16_t place;
@@ -54,19 +50,18 @@ struct Snapshot {
   uint32_t magic;
   uint16_t version;
   uint16_t size;
-  int64_t seq;
+  char etag[40];
   int32_t fetchedAt;
   int32_t firstDay;
-  uint8_t calendarCount;
   uint8_t eventCount;
   uint8_t todoCount;
   uint8_t sleepCount;
   bool sleepEnabled;
   uint16_t poolUsed;
-  Calendar calendars[kMaxCalendars];
   Event events[kMaxEvents];
   Todo todos[kMaxTodos];
   SleepWindow sleep[kMaxSleep];
+  Weather weather;
   char pool[kPoolSize];
 };
 

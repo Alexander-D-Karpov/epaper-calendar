@@ -7,6 +7,7 @@ ESP8266 firmware that shows today's schedule and todos from [calendar](https://g
 ## Features
 
 - Current / next event, day timeline, all-day events, overdue todos (up to 14 days)
+- Outdoor temperature and weather icon (clear, cloudy, fog, drizzle, rain, snow, thunder); the sky picture follows the weather too
 - Four themes driven by the real sun position (St. Petersburg by default): morning, day, evening, night
 - Sleep screen during the sleep window from the account settings
 - Live clock, countdowns and progress via fast b/w partial refresh, no flashing
@@ -39,7 +40,7 @@ Power the panel from 3V3, not VIN. The FLASH button (GPIO0) needs no wiring. Don
 
 ## Setup
 
-1. Create an API token in the calendar under Settings → API tokens, with scopes `account:read`, `calendars:read` and `todos:read`.
+1. Create an API token in the calendar under Settings → API tokens, with scope `display:read`. The calendar must be recent enough to serve `/api/v1/display`.
 2. Fill in `.env`:
 
    ```bash
@@ -67,22 +68,25 @@ Power the panel from 3V3, not VIN. The FLASH button (GPIO0) needs no wiring. Don
 
 ## How it works
 
-- Polls `/api/v1/changes` every 3 minutes and refetches `/me`, `/calendars`, `/events` (7 days) and `/todos` only when something changed, on a new day, or every 6 hours.
-- Partial refresh runs every minute for the clock, countdowns, progress bar and the "now" marker. These areas are kept strictly black/white because the panel's fast mode can't drive red.
-- A full refresh happens on event start/end, sun phase change, new data, a new day, sleep, or an online/offline switch. A clean-up full refresh runs every 4 hours.
-- TLS uses the Let's Encrypt roots (ISRG X1/X2). JSON is stream-parsed item by item, and a second IRAM heap is enabled to leave DRAM for TLS.
+- Polls `/api/v1/display` every 3 minutes with `If-None-Match`, so an unchanged day costs a bodyless `304`. One reply carries today and tomorrow: events, todos, sleep windows and weather.
+- Weather comes from [Open-Meteo](https://open-meteo.com) through the calendar server for `GEO_LAT`/`GEO_LON`, cached there for 15 minutes. It is hidden if older than 3 hours.
+- Partial refresh runs every minute for the clock, countdowns, progress bar, "now" marker and weather line. These areas are kept strictly black/white because the panel's fast mode can't drive red.
+- A full refresh happens on event start/end, sun phase or weather type change, new data, a new day, sleep, or an online/offline switch. A clean-up full refresh runs every 4 hours, and one is forced if the screen has not changed for 10 minutes.
+- TLS uses the Let's Encrypt roots (ISRG X1/X2). The body is read whole, TLS is closed, then JSON is parsed. A second IRAM heap holds the TLS buffers.
 
 ## Layout
 
 ```
 scripts/   env.py (.env → build flags), fonts.py (font generator)
 src/       app      scheduler, refresh logic, button
-           api      HTTPS + streaming JSON
+           api      HTTPS client for /api/v1/display
+           model    snapshot layout and string pool
            store    LittleFS snapshot cache
            render   screens, dithering, live regions
            agenda   current/next/tomorrow/todos selection
            sun      NOAA sun position and day phases
            text     UTF-8 → font code page, wrapping, ellipsis
+           picture  bitmap shown by the FLASH button
 ```
 
 Tunables (refresh intervals, limits) live in `src/config.h` and `src/model.h`.

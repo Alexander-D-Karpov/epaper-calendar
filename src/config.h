@@ -43,13 +43,13 @@ constexpr uint32_t kButtonDebounceMs = 50;
 constexpr uint32_t kButtonGapMs = 300;
 constexpr uint32_t kLoopMs = 15000;
 constexpr uint32_t kPollSec = 180;
-constexpr uint32_t kRefetchSec = 6 * 3600;
 constexpr uint32_t kMinRenderGapSec = 180;
 constexpr uint32_t kPartialSec = 60;
 constexpr uint32_t kCleanSec = 4 * 3600;
 constexpr uint16_t kMaxPartials = 240;
+constexpr uint32_t kStuckSec = 600;
 constexpr uint32_t kWifiRetryMs = 30000;
 constexpr uint32_t kBootWaitMs = 45000;
-constexpr int kEventDays = 7;
+constexpr int kDisplayDays = 2;
 constexpr int kOverdueDays = 14;
 } // namespace cfg

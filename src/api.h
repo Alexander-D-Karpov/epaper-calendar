@@ -3,5 +3,7 @@
 
 #include "model.h"
 
-bool apiLatestSeq(int64_t& latest);
-bool apiFetchAll(Snapshot& s);
+enum class FetchResult : uint8_t { Updated, NotModified, Failed };
+
+// One GET /api/v1/display; with conditional set it sends the stored ETag.
+FetchResult apiFetchDisplay(Snapshot &s, bool conditional);
